@@ -16,20 +16,28 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
+from typing import Any
 from unittest import mock
 
+from google.adk.agents import context as context_lib
+from google.adk.agents._caller_principal import CallerPrincipal
 from google.adk.agents.base_agent import BaseAgent
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.apps import App
 from google.adk.events._interrupts import extract_event_interrupt_ids
+from google.adk.events.event import Event
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.sessions.session import Session
 from google.adk.tools.base_tool import BaseTool
+from google.adk.utils.context_utils import Aclosing
 from google.adk.workflow import FunctionNode
 from google.adk.workflow import START
-from google.adk.workflow._base_node import BaseNode
-from google.adk.workflow._node import node
 from google.adk.workflow._node import Node
+from google.adk.workflow._node import node
 from google.adk.workflow._parallel_worker import _ParallelWorker as ParallelWorker
 from google.adk.workflow._retry_config import RetryConfig
 from google.adk.workflow._tool_node import _ToolNode as ToolNode
@@ -576,6 +584,124 @@ async def test_node_require_confirmation_workflow_execution(
     )
 
 
+class _ConfirmedFunctionNodeWorkflow:
+  """A Workflow with one `@node(require_confirmation=True)` node.
+
+  Mirrors `_ConfirmationWorkflow` in test_tool_node.py for the FunctionNode
+  confirmation path, which stores the resumed answer the same way.
+  """
+
+  def __init__(self) -> None:
+    from google.adk.apps.app import ResumabilityConfig
+
+    self.calls: list[str] = []
+    self.downstream_seen: list[object] = []
+
+    class RemoveResult(BaseModel):
+      removed: bool
+
+    @node(require_confirmation=True)
+    def remove_file() -> RemoveResult:
+      self.calls.append("removed")
+      return RemoveResult(removed=True)
+
+    def after_node(node_input):
+      self.downstream_seen.append(node_input)
+      return node_input
+
+    wf = Workflow(
+        name="confirm_wf",
+        edges=[(START, remove_file), (remove_file, after_node)],
+    )
+    self.runner = testing_utils.InMemoryRunner(
+        app=App(
+            name="test_confirm_wf",
+            root_agent=wf,
+            resumability_config=ResumabilityConfig(is_resumable=True),
+        )
+    )
+
+  async def start(self) -> Event:
+    """Runs the workflow and returns its confirmation request."""
+    from google.adk.utils._function_call_names import REQUEST_INPUT_FUNCTION_CALL_NAME
+
+    from . import workflow_testing_utils
+
+    events = await self.runner.run_async("start")
+    request = workflow_testing_utils.find_function_call_event(
+        events, REQUEST_INPUT_FUNCTION_CALL_NAME
+    )
+    assert request is not None
+    assert not self.calls
+    return request
+
+  async def answer(
+      self, request: Event, *, caller_principal: CallerPrincipal
+  ) -> None:
+    """Approves the request on an invocation a serving layer attributed.
+
+    `caller_principal` stands in for what the serving layer would set on the
+    invocation that carries the answer.
+    """
+    from google.adk.workflow.utils._workflow_hitl_utils import create_request_input_response
+
+    [interrupt_id] = extract_event_interrupt_ids(request)
+    session = self.runner.session
+    async for _ in self.runner.runner.run_async(
+        user_id=session.user_id,
+        session_id=session.id,
+        invocation_id=request.invocation_id,
+        new_message=testing_utils.UserContent(
+            create_request_input_response(interrupt_id, {"confirmed": True})
+        ),
+        caller_principal=caller_principal,
+    ):
+      pass
+
+
+@pytest.mark.asyncio
+async def test_node_require_confirmation_from_unauthenticated_caller_refused_in_strict_mode(
+    monkeypatch,
+):
+  """An approval the serving layer could not attribute is stored as a rejection.
+
+  Same decision as the agent confirmation flow and the tool node: with strict
+  mode on, a resume that arrives with an unauthenticated principal must not
+  run the function, and the node answers with the rejection output.
+  """
+  monkeypatch.setenv("ADK_ENABLE_STRICT_CALLER_PRINCIPAL", "1")
+  wf = _ConfirmedFunctionNodeWorkflow()
+  request = await wf.start()
+
+  await wf.answer(
+      request,
+      caller_principal=CallerPrincipal(authenticated=False, source="a2a"),
+  )
+
+  assert not wf.calls
+  assert wf.downstream_seen == [{"error": "This tool call is rejected."}]
+
+
+@pytest.mark.asyncio
+async def test_node_require_confirmation_from_authenticated_caller_runs_function(
+    monkeypatch,
+):
+  """An approval from a caller the serving layer verified is honored."""
+  monkeypatch.setenv("ADK_ENABLE_STRICT_CALLER_PRINCIPAL", "1")
+  wf = _ConfirmedFunctionNodeWorkflow()
+  request = await wf.start()
+
+  await wf.answer(
+      request,
+      caller_principal=CallerPrincipal(
+          authenticated=True, user_name="operator", source="a2a"
+      ),
+  )
+
+  assert wf.calls == ["removed"]
+  assert wf.downstream_seen == [{"removed": True}]
+
+
 @pytest.mark.parametrize(
     "target_path,should_pause", [("/dev/tmp", False), ("/prod/db", True)]
 )
@@ -1067,3 +1193,52 @@ async def test_node_require_confirmation_runs_before_auth_gate(confirmed: bool):
   )
   assert calls == ["secret_key_123"]
   assert any(e.output == "authed_done" for e in events3)
+
+
+def test_node_iter_static_children_parallel_worker():
+  """Node._iter_static_children yields _inner_node when parallel_worker is True."""
+  node_inst = _CustomNode(name="subclass", parallel_worker=True)
+  children = list(node_inst._iter_static_children())
+  assert children == [node_inst._inner_node]
+
+
+def test_node_iter_static_children_plain_node():
+  """Node._iter_static_children yields nothing when parallel_worker is False."""
+  node_inst = _CustomNode(name="subclass", parallel_worker=False)
+  assert list(node_inst._iter_static_children()) == []
+
+
+@pytest.mark.asyncio
+async def test_node_run_impl_early_close_closes_inner_generator():
+  """Closing Node._run_impl early closes run_node_impl."""
+  cleaned_up = False
+  first_event = Event(author="cleanup_node")
+  second_event = Event(author="cleanup_node")
+
+  class _CleanupNode(Node):
+
+    async def run_node_impl(
+        self, *, ctx: context_lib.Context, node_input: Any
+    ) -> AsyncGenerator[Any, None]:
+      nonlocal cleaned_up
+      try:
+        yield first_event
+        yield second_event
+      finally:
+        await asyncio.sleep(0)
+        cleaned_up = True
+
+  node_inst = _CleanupNode(name="cleanup_node")
+  session = Session(app_name="test", user_id="user", id="session")
+  ic = InvocationContext(
+      invocation_id="inv",
+      session=session,
+      session_service=InMemorySessionService(),
+  )
+  ctx = context_lib.Context(ic, node=node_inst)
+
+  async with Aclosing(node_inst.run(ctx=ctx, node_input=None)) as agen:
+    first = await anext(agen)
+    assert first is first_event
+
+  assert cleaned_up
